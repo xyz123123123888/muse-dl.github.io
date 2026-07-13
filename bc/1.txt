@@ -1,0 +1,66 @@
+<!-- ==========================================
+ Muse AI 音乐下载工具 - 用户协议弹窗（纯前端版）
+ 使用说明：
+ 1. 用户必须将本声明滚动到底部，勾选框才会启用
+ 2. 勾选并点击“确认”后，才能使用下载功能
+ 3. 用户同意状态仅保存在浏览器本地，不做任何服务端记录
+========================================== -->
+
+<div id="agreement-modal">
+  <h2>重要提示：请在仔细阅读并确认后使用</h2>
+  <p>本工具是一个个人学习研究项目，仅供您下载<strong>自己</strong>使用Muse AI创作的音乐。</p>
+  <p>在继续之前，您必须确认并承诺以下事项：</p>
+  <ol>
+    <li><strong>您拥有完整权利</strong>：您即将下载的音乐，是由您本人使用Muse AI创作，您拥有该作品的全部合法权利，包括著作权。</li>
+    <li><strong>您不会用于侵权</strong>：您不会利用本工具下载任何他人的、未经授权的、或侵犯第三方合法权益（包括但不限于著作权、商标权、隐私权）的音乐内容。</li>
+    <li><strong>您知晓官方渠道</strong>：本工具并非Muse AI官方产品。我们强烈建议您直接使用Muse AI官方渠道下载您创作的音乐。Muse AI官方联系方式：duliang@atmob.com。</li>
+    <li><strong>您自愿承担风险</strong>：任何因您违反上述承诺、不当使用本工具所产生的一切法律后果与风险，均由您本人完全承担，本工具及开发者不承担任何责任。</li>
+    <li><strong>您知晓寻求帮助的途径</strong>：如遇知识产权争议，您可以联系本站开发者 tnt111h111@gmail.com ，或拨打国家法律咨询热线 12348 获取专业指导。</li>
+  </ol>
+  <p>我已逐条阅读、充分理解并郑重承诺遵守以上所有条款。</p>
+  <label>
+    <input type="checkbox" id="agree-checkbox" disabled>
+    我同意并承诺遵守上述条款
+  </label>
+  <button id="confirm-btn" disabled>确认并继续</button>
+</div>
+
+<script>
+  // ==========================================
+  // 交互逻辑（纯前端，请勿移除）
+  // 1. 必须滚动到底部才能启用勾选
+  // 2. 同意状态存入 localStorage，下次访问无需重新确认
+  // ==========================================
+  (function() {
+    const modal = document.getElementById('agreement-modal');
+    const checkbox = document.getElementById('agree-checkbox');
+    const confirmBtn = document.getElementById('confirm-btn');
+
+    // 如果之前已同意过，直接跳过弹窗
+    if (localStorage.getItem('muse-tool-agreed') === 'yes') {
+      modal.style.display = 'none';
+      return;
+    }
+
+    // 检测是否滚动到底部
+    modal.addEventListener('scroll', function() {
+      const scrollTolerance = 5;
+      if (modal.scrollTop + modal.clientHeight >= modal.scrollHeight - scrollTolerance) {
+        checkbox.disabled = false;
+      }
+    });
+
+    // 勾选后启用确认按钮
+    checkbox.addEventListener('change', function() {
+      confirmBtn.disabled = !checkbox.checked;
+    });
+
+    // 确认后记录状态并关闭弹窗
+    confirmBtn.addEventListener('click', function() {
+      localStorage.setItem('muse-tool-agreed', 'yes');
+      localStorage.setItem('muse-tool-agreed-time', new Date().toISOString());
+      modal.style.display = 'none';
+      // 此处触发你的主功能初始化
+    });
+  })();
+</script>

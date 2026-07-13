@@ -1,0 +1,7 @@
+flask>=3.0
+requests>=2.31
+# Waitress: 生产级 WSGI 服务器, 替代 Flask dev server (无 dev 警告 + 多线程更稳)
+waitress>=3.0
+# Playwright 是备用抓取手段, requests 失败时才会用到
+# 如果不需要可以注释掉下面两行 (只是无法用 Playwright 兜底)
+playwright>=1.40
