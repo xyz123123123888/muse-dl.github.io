@@ -1,0 +1,829 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>muse-dl</title>
+<style>
+  /* ============================================
+     muse-dl :: 终端复古主题
+     配色: 磷光绿 phosphor green on near-black
+     字体: 等宽 monospace
+     效果: CRT 扫描线 + 边缘暗角 + 文字微发光
+     ============================================ */
+
+  :root {
+    --bg:        #0a0a0a;
+    --bg-panel:  #050505;
+    --fg:        #00ff41;       /* phosphor green */
+    --fg-dim:    #00b830;
+    --fg-mute:   #4a6a4a;       /* 极淡绿, 注释/未激活 */
+    --err:       #ff5555;
+    --warn:      #ffaa00;       /* amber, 用于 alert 弹窗标题 */
+    --text-dim:  #6a6a6a;       /* 底部 footer 灰字 */
+    --border:    #1a3a1a;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body { margin: 0; padding: 0; }
+
+  body {
+    font-family: ui-monospace, "Cascadia Code", "JetBrains Mono", "Fira Code",
+                 "SF Mono", Consolas, "Courier New", monospace;
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--fg);
+    background: var(--bg);
+    min-height: 100vh;
+    padding: 28px 18px 18px;
+    /* 文字轻微磷光 */
+    text-shadow: 0 0 2px rgba(0, 255, 65, 0.35);
+  }
+
+  /* CRT 扫描线 (横纹) :: 覆盖在内容之上, 不接收事件 */
+  body::before {
+    content: "";
+    position: fixed; inset: 0;
+    pointer-events: none;
+    z-index: 9000;
+    background: repeating-linear-gradient(
+      0deg,
+      rgba(0, 0, 0, 0)   0px,
+      rgba(0, 0, 0, 0)   2px,
+      rgba(0, 255, 65, 0.05) 2px,
+      rgba(0, 255, 65, 0.05) 3px
+    );
+  }
+  /* CRT 边缘暗角 ::after */
+  body::after {
+    content: "";
+    position: fixed; inset: 0;
+    pointer-events: none;
+    z-index: 9001;
+    background: radial-gradient(
+      ellipse at center,
+      transparent 55%,
+      rgba(0, 0, 0, 0.55) 100%
+    );
+  }
+
+  /* ---- 顶部 ASCII 标题 ---- */
+  .ascii {
+    white-space: pre;
+    color: var(--fg);
+    text-shadow: 0 0 6px rgba(0, 255, 65, 0.6);
+    font-size: 13px;
+    line-height: 1.1;
+    margin: 0 0 6px;
+    user-select: none;
+  }
+  /* 终端打印光标 ▌ */
+  .cursor {
+    display: inline-block;
+    width: 0.55em;
+    background: var(--fg);
+    box-shadow: 0 0 6px var(--fg);
+    animation: blink 1s steps(1) infinite;
+    vertical-align: text-bottom;
+    margin-left: 2px;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* 顶部状态条 (登录 banner 风格) */
+  .banner {
+    color: var(--fg-dim);
+    font-size: 12px;
+    margin: 8px 0 22px;
+    padding-bottom: 10px;
+    border-bottom: 1px dashed var(--border);
+  }
+  .banner .dot { color: var(--fg-mute); margin: 0 8px; }
+  .banner a {
+    color: var(--fg);
+    text-decoration: none;
+    border-bottom: 1px dotted var(--fg-dim);
+  }
+  .banner a:hover { color: var(--fg); text-shadow: 0 0 6px var(--fg); }
+
+  /* ---- 主面板: 一个无圆角的"终端窗口" ---- */
+  .term {
+    max-width: 760px;
+    margin: 0 auto;
+    border: 1px solid var(--fg-dim);
+    background: var(--bg-panel);
+    padding: 18px 20px 22px;
+    box-shadow:
+      inset 0 0 40px rgba(0, 255, 65, 0.04),
+      0 0 0 1px rgba(0, 255, 65, 0.05);
+  }
+
+  .prompt-line {
+    color: var(--fg-dim);
+    margin-bottom: 6px;
+    font-size: 13px;
+  }
+  .prompt-line .ps { color: var(--fg); }
+
+  /* ---- 输入框 + 按钮 (终端 prompt 风格) ---- */
+  .row {
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+    margin-bottom: 14px;
+  }
+  .row .ps-pre { color: var(--fg); align-self: center; padding-right: 4px; }
+  input[type=text] {
+    flex: 1;
+    padding: 8px 10px;
+    background: #000;
+    color: var(--fg);
+    border: 1px solid var(--fg-dim);
+    border-radius: 0;
+    font: inherit;
+    font-size: 13px;
+    outline: none;
+    text-shadow: 0 0 2px rgba(0, 255, 65, 0.35);
+  }
+  input[type=text]:focus {
+    border-color: var(--fg);
+    box-shadow: 0 0 8px rgba(0, 255, 65, 0.4);
+  }
+  input[type=text]::placeholder { color: var(--fg-mute); }
+
+  button {
+    font: inherit;
+    font-size: 13px;
+    padding: 8px 16px;
+    background: var(--fg);
+    color: #000;
+    border: 1px solid var(--fg);
+    border-radius: 0;
+    cursor: pointer;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-shadow: none;
+  }
+  button:hover:not(:disabled) { background: #000; color: var(--fg); }
+  button:disabled { background: var(--fg-mute); border-color: var(--fg-mute); color: #000; cursor: not-allowed; }
+
+  /* ---- 字符进度条 ---- */
+  .progress { margin: 12px 0 4px; }
+  .bar-chars {
+    font-size: 14px;
+    letter-spacing: 0;
+    color: var(--fg);
+    text-shadow: 0 0 4px rgba(0, 255, 65, 0.6);
+    white-space: pre;
+  }
+  .bar-chars .done { color: var(--fg); }
+  .bar-chars .todo { color: var(--fg-mute); }
+  .stage {
+    color: var(--fg-dim);
+    font-size: 12px;
+    margin-top: 4px;
+  }
+  .stage::before { content: "> "; color: var(--fg); }
+
+  /* ---- 结果区 (终端输出风格) ---- */
+  .result {
+    margin-top: 16px;
+    padding: 12px 14px;
+    border-left: 3px solid var(--fg-dim);
+    background: rgba(0, 255, 65, 0.03);
+    font-size: 13px;
+  }
+  .result.ok  { border-left-color: var(--fg);  }
+  .result.err { border-left-color: var(--err); color: var(--err); text-shadow: 0 0 3px rgba(255,85,85,0.5); }
+  .result .tag {
+    display: inline-block;
+    padding: 0 6px;
+    margin-right: 6px;
+    font-weight: 700;
+    font-size: 12px;
+  }
+  .result.ok  .tag { background: var(--fg); color: #000; text-shadow: none; }
+  .result.err .tag { background: var(--err); color: #000; text-shadow: none; }
+  .result .line { margin: 2px 0; }
+  .result .line .k { color: var(--fg-mute); display: inline-block; min-width: 80px; }
+  .dl-btn {
+    display: inline-block;
+    margin-top: 8px;
+    padding: 4px 10px;
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid var(--fg);
+    text-decoration: none;
+    font-weight: 600;
+    text-shadow: 0 0 3px rgba(0, 255, 65, 0.5);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+  }
+  .dl-btn:hover { background: var(--fg); color: #000; text-shadow: none; }
+  .dl-btn::before { content: "[ "; }
+  .dl-btn::after  { content: " ]"; }
+  .dl-btn:disabled { border-color: var(--fg-mute); color: var(--fg-mute); cursor: not-allowed; }
+  .dl-btn:disabled::before, .dl-btn:disabled::after { color: var(--fg-mute); }
+
+  /* ---- 历史下载 (ls -t 风格) ---- */
+  .history {
+    margin-top: 20px;
+    padding-top: 14px;
+    border-top: 1px dashed var(--border);
+  }
+  .history h3 {
+    color: var(--fg-dim);
+    font-size: 12px;
+    font-weight: 400;
+    margin: 0 0 8px;
+  }
+  .history h3::before { content: "# "; color: var(--fg-mute); }
+  .history ul {
+    list-style: none; padding: 0; margin: 0;
+    max-height: 180px; overflow-y: auto;
+    font-size: 12px;
+  }
+  .history li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 2px 4px;
+    color: var(--fg-dim);
+    gap: 8px;
+  }
+  .history li:hover { background: rgba(0, 255, 65, 0.05); }
+  .history li .name { color: var(--fg); }
+  .history li .meta { color: var(--fg-mute); margin: 0 6px; }
+  .history li a {
+    color: var(--fg);
+    text-decoration: none;
+    padding: 1px 6px;
+    border: 1px solid var(--fg-dim);
+    font-size: 11px;
+  }
+  .history li a:hover { background: var(--fg); color: #000; text-shadow: none; }
+  .history li a.expired { color: var(--fg-mute); border-color: var(--fg-mute); cursor: not-allowed; }
+  .history li a.expired:hover { background: transparent; color: var(--fg-mute); text-shadow: none; }
+  .history-empty { color: var(--fg-mute); font-style: italic; font-size: 12px; }
+
+  /* ---- 页面底部 footer ---- */
+  .footer {
+    max-width: 760px;
+    margin: 14px auto 0;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 11px;
+    text-shadow: none;
+  }
+  .footer::before { content: "# "; color: var(--fg-mute); }
+
+  /* ---- 免责协议弹窗 (终端 ALERT 风格) ---- */
+  .modal-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.78);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 9999;
+    padding: 16px;
+  }
+  .modal {
+    background: var(--bg-panel);
+    border: 1px solid var(--warn);
+    color: var(--fg);
+    max-width: 560px;
+    width: 100%;
+    padding: 0;
+    font: inherit;
+    box-shadow:
+      0 0 0 1px rgba(255, 170, 0, 0.2),
+      0 0 30px rgba(255, 170, 0, 0.15),
+      inset 0 0 40px rgba(255, 170, 0, 0.04);
+  }
+  .modal-header {
+    background: var(--warn);
+    color: #000;
+    padding: 6px 14px;
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 0.5px;
+    text-shadow: none;
+  }
+  .modal-body { padding: 16px 20px 6px; font-size: 13px; max-height: 60vh; overflow-y: auto; }
+  .modal-body p { margin: 0 0 10px; color: var(--warn); font-weight: 600; }
+  .modal-body ol {
+    list-style: none; padding: 0; margin: 0 0 12px;
+    color: var(--fg-dim); line-height: 1.7; counter-reset: agreement;
+  }
+  .modal-body ol li {
+    counter-increment: agreement;
+    padding-left: 1.6em;
+    position: relative;
+    margin: 4px 0;
+  }
+  .modal-body ol li::before {
+    content: "[" counter(agreement) "] ";
+    color: var(--fg-mute);
+    position: absolute; left: 0;
+  }
+  .modal-body .scroll-hint {
+    color: var(--fg-mute); font-size: 11px; font-style: italic;
+    text-align: center; margin: 8px 0 0; text-shadow: none;
+  }
+  .modal-body .scroll-hint.dismissed { display: none; }
+  .check-row {
+    display: flex; align-items: flex-start; gap: 8px;
+    margin: 12px 0 0;
+    cursor: pointer; user-select: none;
+    color: var(--fg);
+  }
+  .check-row input { margin-top: 4px; accent-color: var(--fg); transform: scale(1.1); }
+  .modal-actions {
+    display: flex; gap: 10px; justify-content: flex-end;
+    padding: 14px 20px 18px;
+  }
+  .modal button {
+    padding: 6px 16px;
+    font-size: 12px;
+    font-weight: 700;
+    border-radius: 0;
+  }
+  .modal .btn-cancel {
+    background: transparent;
+    color: var(--fg-mute);
+    border: 1px solid var(--fg-mute);
+  }
+  .modal .btn-cancel:hover { background: var(--fg-mute); color: #000; text-shadow: none; }
+  .modal .btn-accept { background: var(--fg); color: #000; border: 1px solid var(--fg); }
+  .modal .btn-accept:hover { background: #000; color: var(--fg); }
+  .modal .btn-accept:disabled {
+    background: transparent; color: var(--fg-mute);
+    border: 1px dashed var(--fg-mute); cursor: not-allowed;
+  }
+  .modal .btn-accept:disabled:hover { background: transparent; color: var(--fg-mute); }
+</style>
+</head>
+<body>
+<!-- 免责协议弹窗: 必须滚动到底部才能勾选; 同意后 localStorage 永久记录, 不再重弹 -->
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal">
+    <div class="modal-header">[!] ALERT :: USE FOR LEARNING & TECHNICAL STUDY ONLY</div>
+    <div class="modal-body" id="modalBody">
+      <p>重要提示: 请仔细阅读并确认后使用。</p>
+      <p>本工具仅供您下载<strong>自己</strong>使用 Muse AI 创作的音乐。在继续之前, 您必须确认并承诺以下事项:</p>
+      <ol>
+        <li><strong>您拥有完整权利</strong>: 您即将下载的音乐, 是由您本人使用 Muse AI 创作, 您拥有该作品的全部合法权利, 包括著作权。</li>
+        <li><strong>您不会用于侵权</strong>: 您不会利用本工具下载任何他人的、未经授权的、或侵犯第三方合法权益 (包括但不限于著作权、商标权、隐私权) 的音乐内容。</li>
+        <li><strong>您知晓官方渠道</strong>: 本工具并非 Muse AI 官方产品。我们强烈建议您直接使用 Muse AI 官方渠道下载您创作的音乐。Muse AI 官方联系方式: duliang@atmob.com。</li>
+        <li><strong>您自愿承担风险</strong>: 任何因您违反上述承诺、不当使用本工具所产生的一切法律后果与风险, 均由您本人完全承担, 本工具及开发者不承担任何责任。</li>
+        <li><strong>您知晓寻求帮助的途径</strong>: 如遇知识产权争议, 您可以联系开发者 tnt111h111@gmail.com, 或拨打国家法律咨询热线 12348 获取专业指导。</li>
+      </ol>
+      <p>我已逐条阅读、充分理解并郑重承诺遵守以上所有条款。</p>
+      <div class="scroll-hint" id="scrollHint">&gt; 请向下滚动到底部以激活同意选项 &lt;</div>
+      <label class="check-row">
+        <input type="checkbox" id="agreeCheck" disabled onchange="onAgreeChange()" onclick="onAgreeChange()">
+        <span>我同意并承诺遵守上述条款</span>
+      </label>
+      <div class="modal-spacer" aria-hidden="true" style="height: 200px; min-height: 200px; flex-shrink: 0;"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-cancel" id="rejectBtn" type="button" onclick="onReject()">[ REJECT ]</button>
+      <button class="btn-accept" id="acceptBtn" type="button" disabled onclick="onAccept()">[ CONFIRM ]</button>
+    </div>
+  </div>
+</div>
+
+<div class="term">
+<pre class="ascii"> __  __ _____ ____  _      ____
+|  \/  |  _  / ___|| |    |  _ \
+| |\/| | |_| \___ \| |    | | | |
+|_|  |_|_____/___ /| |___ |_| |_|
+                                        <span class="cursor"></span></pre>
+
+  <div class="banner">
+    <span>muse-dl v0.2.0</span><span class="dot">::</span>
+    <span>static, client-side, no backend</span><span class="dot">::</span>
+    <span>h5.muse.top scraper</span>
+  </div>
+
+  <div class="prompt-line"><span class="ps">$</span> paste h5.muse.top link and press ENTER:</div>
+  <div class="row">
+    <span class="ps-pre">&gt;</span>
+    <input type="text" id="urlInput" autocomplete="off" spellcheck="false"
+           placeholder="https://h5.muse.top/song?id=...">
+    <button id="goBtn">[ DOWNLOAD ]</button>
+  </div>
+
+  <div class="progress" id="progressBox" style="display:none">
+    <div class="bar-chars" id="barChars">[                    ]   0%</div>
+    <div class="stage" id="stageText">idle</div>
+  </div>
+
+  <div class="result" id="resultBox" style="display:none"></div>
+
+  <div class="history" id="historyBox" style="display:none">
+    <h3>history (this session + localStorage; blob 刷新后失效)</h3>
+    <ul id="historyList"></ul>
+  </div>
+</div>
+
+<div class="footer">仅供学习交流使用, 严禁用于非法用途</div>
+
+<!-- JSZip: 浏览器内打包 zip -->
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+<script>
+// ===== 免责协议 (滚动到底部才能勾选; 同意后 localStorage 永久记录, 不再重弹) =====
+window.syncAcceptBtn = function() {
+  const a = document.getElementById('acceptBtn');
+  const c = document.getElementById('agreeCheck');
+  if (!a || !c) return;
+  a.disabled = !c.checked;
+};
+
+window.closeModal = function() {
+  const o = document.getElementById('modalOverlay');
+  if (o) o.style.display = 'none';
+  try {
+    localStorage.setItem('muse-tool-agreed', 'yes');
+    localStorage.setItem('muse-tool-agreed-time', new Date().toISOString());
+  } catch (_) {}
+  window.dispatchEvent(new Event('__disclaimer_closed'));
+};
+
+window.onAgreeChange = function() { window.syncAcceptBtn(); };
+
+window.onAccept = function() {
+  const c = document.getElementById('agreeCheck');
+  if (!c || !c.checked) { window.syncAcceptBtn(); return; }
+  window.closeModal();
+};
+
+window.onReject = function() {
+  if (!confirm('您必须同意协议后才能使用本工具, 确定要离开吗?')) return;
+  if (Math.random() < 0.5) {
+    const win = window.open('', '_self');
+    win.document.write(
+      '<!doctype html><html><head><meta charset="utf-8">' +
+      '<title>redirecting...</title>' +
+      '<style>body{margin:0;background:#000;color:#00ff41;font-family:ui-monospace,Consolas,monospace;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center;}' +
+      'h1{font-size:42px;margin:0 0 16px;letter-spacing:2px;text-shadow:0 0 8px #00ff41;animation:shake .3s infinite alternate;}' +
+      '@keyframes shake{from{transform:translate(-2px,0);}to{transform:translate(2px,0);}}' +
+      'p{color:#00b830;}</style></head>' +
+      '<body><div><h1>&gt;_  you got rickrolled</h1>' +
+      '<p>redirecting to bilibili in 3s ...</p>' +
+      '<script>setTimeout(function(){location.replace("https://www.bilibili.com/video/BV1hq4y1s7VH");}, 3000);<\/script>' +
+      '</div></body></html>'
+    );
+    win.document.close();
+  } else {
+    document.body.innerHTML =
+      '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#0a0a0a;color:#6a6a6a;font-family:ui-monospace,Consolas,monospace;">&gt; access denied. please close this page.</div>';
+  }
+};
+
+window.__initDisclaimer = function() {
+  // 永久记录: 之前同意过则直接跳过 (跟原 bc/1.txt 设计一致)
+  let skip = false;
+  try {
+    if (localStorage.getItem('muse-tool-agreed') === 'yes') skip = true;
+  } catch (_) {}
+  if (skip) {
+    const o = document.getElementById('modalOverlay');
+    if (o) o.style.display = 'none';
+    window.__disclaimer_skipped = true;
+    window.dispatchEvent(new Event('__disclaimer_closed'));
+    return;
+  }
+  // 滚动检测: modal-body 滚到底部才启用勾选
+  const body = document.getElementById('modalBody');
+  const check = document.getElementById('agreeCheck');
+  const hint = document.getElementById('scrollHint');
+  if (body && check) {
+    const onScroll = () => {
+      // 5px 容差
+      if (body.scrollTop + body.clientHeight >= body.scrollHeight - 5) {
+        check.disabled = false;
+        if (hint) hint.classList.add('dismissed');
+        body.removeEventListener('scroll', onScroll);
+      }
+    };
+    body.addEventListener('scroll', onScroll);
+    // 内容不溢出时直接启用 (短协议 / 小窗口)
+    if (body.scrollHeight <= body.clientHeight + 1) onScroll();
+  }
+  window.syncAcceptBtn();
+};
+window.__initDisclaimer();
+
+// ===== 业务 (静态版, 无后端) =====
+const API_URL = 'https://project-api.atmob.com/project/song/v30/song/info';
+const CLIENT_PAYLOAD_BASE = {
+  appPlatform: 3,
+  packageName: 'com.xingchat.land.muse',
+  appVersionCode: '100',
+  appVersionName: '1.0.0',
+};
+const HISTORY_KEY = 'muse_dl_history_v1';
+const BLOB_CACHE = new Map();  // filename -> Blob, 刷新后失效 (模拟"3 天过期")
+
+const $ = (id) => document.getElementById(id);
+const urlInput = $('urlInput');
+const goBtn = $('goBtn');
+const progressBox = $('progressBox');
+const barChars = $('barChars');
+const stageText = $('stageText');
+const resultBox = $('resultBox');
+const historyBox = $('historyBox');
+const historyList = $('historyList');
+
+const BAR_WIDTH = 20;
+function renderBar(p) {
+  const n = Math.max(0, Math.min(1, p || 0));
+  const done = Math.round(n * BAR_WIDTH);
+  const todo = BAR_WIDTH - done;
+  const pct = Math.round(n * 100) + '%';
+  return '[' + '#'.repeat(done) + '-'.repeat(todo) + '] ' + pct.padStart(3, ' ');
+}
+function setStage(text, p) {
+  stageText.textContent = text;
+  if (typeof p === 'number') barChars.textContent = renderBar(p);
+}
+function showResult(kind, html) {
+  resultBox.className = 'result ' + kind;
+  resultBox.innerHTML = html;
+  resultBox.style.display = 'block';
+}
+function reset() {
+  progressBox.style.display = 'none';
+  resultBox.style.display = 'none';
+  barChars.textContent = renderBar(0);
+  stageText.textContent = 'idle';
+}
+function fmtSize(n) {
+  if (n == null) return '?';
+  if (n < 1024) return n + 'B';
+  if (n < 1024*1024) return (n/1024).toFixed(1) + 'K';
+  if (n < 1024*1024*1024) return (n/1024/1024).toFixed(1) + 'M';
+  return (n/1024/1024/1024).toFixed(2) + 'G';
+}
+function fmtTimeAgo(ts) {
+  const sec = Math.max(0, Math.floor(Date.now()/1000 - ts));
+  if (sec < 60)    return sec + 's ago';
+  if (sec < 3600)  return Math.floor(sec/60) + 'm ago';
+  if (sec < 86400) return Math.floor(sec/3600) + 'h ago';
+  return Math.floor(sec/86400) + 'd ago';
+}
+function escapeHtml(s) {
+  return (s || '').replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function safeFilename(s, fallback) {
+  s = (s || '').trim();
+  s = s.replace(/[\\/:*?"<>|\r\n\t]/g, '_').replace(/_+/g, '_').replace(/^[._]+|[._]+$/g, '');
+  return (s || fallback || 'untitled').slice(0, 80);
+}
+function randomHex(n) {
+  const arr = new Uint8Array(n || 8);
+  crypto.getRandomValues(arr);
+  return Array.from(arr, b => b.toString(16).padStart(2, '0')).join('').slice(0, n * 2);
+}
+
+// 从 h5.muse.top 链接抠 workId
+function extractWorkId(url) {
+  const m = String(url).match(/[?&]id=([a-f0-9]{16,})/i);
+  if (!m) throw new Error('无法从链接识别 workId');
+  return m[1];
+}
+
+// 抓元数据
+async function fetchMetadata(workId) {
+  const payload = Object.assign({}, CLIENT_PAYLOAD_BASE, {
+    workId, machineId: randomHex(16),
+  });
+  const r = await fetch(API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status + ' from API');
+  const j = await r.json();
+  if (j.code !== 0) throw new Error('API code=' + j.code + ' ' + (j.msg || ''));
+  const info = j.data.songInfo || {};
+  const user = j.data.userInfo || {};
+  const tpl = j.data.songTemplateInfo || {};
+  const images = [];
+  for (const k of ['imageUrl', 'imageLargeUrl']) {
+    const u = info[k];
+    if (u && !images.includes(u)) images.push(u);
+  }
+  if (!images.length && tpl.imageUrl) images.push(tpl.imageUrl);
+  return {
+    work_id: workId,
+    title: info.title || tpl.title || workId,
+    duration: info.duration,
+    audio_url: info.audioUrl || '',
+    image_urls: images,
+    lyrics: info.lyrics || '',
+    introduction: info.introduction || '',
+    user_name: user.userName || user.nickname || '',
+  };
+}
+
+// 带进度的 fetch (ReadableStream 实时更新)
+async function fetchWithProgress(url, onProgress) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + url.slice(0, 60));
+  const total = parseInt(r.headers.get('content-length') || '0', 10);
+  const reader = r.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.byteLength;
+    if (onProgress) onProgress(received, total);
+  }
+  const out = new Uint8Array(received);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out;
+}
+
+// history (localStorage: 元数据; Blob: 内存 Map, 刷新后失效)
+function loadHist() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch (_) { return []; }
+}
+function saveHistEntry(entry) {
+  const arr = loadHist();
+  arr.unshift(entry);
+  while (arr.length > 50) arr.pop();
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(arr)); } catch (_) {}
+}
+function renderHist() {
+  const arr = loadHist();
+  if (!arr.length) {
+    historyList.innerHTML = '<li class="history-empty">// (empty)</li>';
+    historyBox.style.display = 'block';
+    return;
+  }
+  historyList.innerHTML = arr.map(it => {
+    const inMem = BLOB_CACHE.has(it.filename);
+    const dlHtml = inMem
+      ? '<a href="#" data-fn="' + escapeHtml(it.filename) + '">dl</a>'
+      : '<a class="expired" title="刷新页面后内存中的 zip 已丢失, 请重新下载">expired</a>';
+    return '<li>' +
+      '<span><span class="name">' + escapeHtml(it.filename) + '</span>' +
+      ' <span class="meta">' + fmtSize(it.size) + '  ' + fmtTimeAgo(it.ts) + '</span></span>' +
+      dlHtml +
+    '</li>';
+  }).join('');
+  historyBox.style.display = 'block';
+  // 绑定 dl 链接
+  historyList.querySelectorAll('a[data-fn]').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      const fn = a.dataset.fn;
+      const blob = BLOB_CACHE.get(fn);
+      if (!blob) { a.classList.add('expired'); return; }
+      triggerDownload(blob, fn);
+    });
+  });
+}
+
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+// 触发 zip 打包
+async function packZip(meta, audioBuf, imageBuf) {
+  const titleSafe = safeFilename(meta.title, meta.work_id);
+  const zip = new JSZip();
+  if (audioBuf) zip.file(titleSafe + '.mp3', audioBuf);
+  if (imageBuf) zip.file('cover_1.jpg', imageBuf);
+  if (meta.lyrics && meta.lyrics.trim()) {
+    const header = '[ti:' + (meta.title || '') + ']\n[ar:' + (meta.user_name || '') + ']\n';
+    zip.file(titleSafe + '.lrc', header + meta.lyrics);
+  }
+  const info = {
+    work_id: meta.work_id,
+    title: meta.title,
+    user_name: meta.user_name,
+    duration_sec: meta.duration,
+    introduction: meta.introduction,
+    audio_url: meta.audio_url,
+    image_urls: meta.image_urls,
+    fetched_at: new Date().toISOString(),
+    note: 'fetched client-side, no backend stored',
+  };
+  zip.file('info.json', JSON.stringify(info, null, 2));
+  const readme = [
+    'title:    ' + (meta.title || ''),
+    'author:   ' + (meta.user_name || ''),
+    'duration: ' + (meta.duration || '') + ' sec',
+    'workId:   ' + (meta.work_id || ''),
+    'intro:    ' + (meta.introduction || ''),
+    'fetched:  ' + info.fetched_at,
+    '',
+    'NOTE: 此 zip 由浏览器端静态工具生成, 不经过任何后端存储.',
+  ].join('\n');
+  zip.file('README.txt', readme);
+
+  return await zip.generateAsync(
+    { type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } },
+    (m) => setStage('packing zip: ' + m.percent.toFixed(0) + '%', 0.92 + 0.08 * (m.percent / 100))
+  );
+}
+
+// 主流程
+async function start() {
+  const url = urlInput.value.trim();
+  if (!url) { setStage('error: empty input'); return; }
+  let workId;
+  try { workId = extractWorkId(url); }
+  catch (e) { showResult('err', '<span class="tag">[ERR]</span>' + escapeHtml(e.message)); return; }
+
+  reset();
+  goBtn.disabled = true;
+  goBtn.textContent = '[ ... ]';
+  progressBox.style.display = 'block';
+
+  try {
+    // 1) 元数据
+    setStage('fetching metadata ...', 0.02);
+    const meta = await fetchMetadata(workId);
+    setStage('metadata ok, downloading audio ...', 0.08);
+
+    // 2) 音频 (主时间)
+    if (!meta.audio_url) throw new Error('没有 audioUrl, 抓不到音频');
+    const audioBuf = await fetchWithProgress(meta.audio_url, (rec, total) => {
+      const p = total ? 0.08 + 0.74 * (rec / total) : 0.45;
+      setStage('downloading mp3: ' + fmtSize(rec) + ' / ' + fmtSize(total), p);
+    });
+    setStage('audio done, downloading cover ...', 0.84);
+
+    // 3) 封面
+    let imageBuf = null;
+    if (meta.image_urls.length) {
+      try {
+        imageBuf = await fetchWithProgress(meta.image_urls[0], (rec, total) => {
+          const p = total ? 0.84 + 0.08 * (rec / total) : 0.88;
+          setStage('downloading cover: ' + fmtSize(rec) + ' / ' + fmtSize(total), p);
+        });
+      } catch (e) {
+        // 封面失败不致命
+        console.warn('cover failed:', e);
+        setStage('cover failed (skip), packing zip ...', 0.92);
+      }
+    } else {
+      setStage('no cover, packing zip ...', 0.92);
+    }
+
+    // 4) 打包
+    const blob = await packZip(meta, audioBuf, imageBuf);
+    setStage('done, triggering download ...', 1.0);
+
+    // 5) 触发下载
+    const filename = 'muse_' + meta.work_id.slice(0, 8) + '_' + randomHex(8) + '.zip';
+    BLOB_CACHE.set(filename, blob);
+    triggerDownload(blob, filename);
+
+    // 6) 显示结果 + 入历史
+    showResult('ok',
+      '<span class="tag">[OK]</span>fetch complete' +
+      '<div class="line"><span class="k">title</span>' + escapeHtml(meta.title) + '</div>' +
+      '<div class="line"><span class="k">workId</span>' + meta.work_id + '</div>' +
+      '<div class="line"><span class="k">author</span>' + escapeHtml(meta.user_name || '?') + '</div>' +
+      '<div class="line"><span class="k">size</span>' + fmtSize(blob.size) + '</div>' +
+      '<a class="dl-btn" id="redownload">re-download</a>'
+    );
+    $('redownload').addEventListener('click', () => triggerDownload(blob, filename));
+    saveHistEntry({ filename, size: blob.size, ts: Math.floor(Date.now()/1000), workId: meta.work_id, title: meta.title });
+    renderHist();
+  } catch (e) {
+    console.error(e);
+    showResult('err', '<span class="tag">[ERR]</span>' + escapeHtml(e.message || String(e)));
+    barChars.textContent = renderBar(0);
+    setStage('failed', 0);
+  } finally {
+    goBtn.disabled = false;
+    goBtn.textContent = '[ DOWNLOAD ]';
+  }
+}
+
+goBtn.addEventListener('click', start);
+urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') start(); });
+
+// disclaimer 关闭后(或跳过)才加载历史
+if (window.__disclaimer_skipped) {
+  renderHist();
+} else {
+  window.addEventListener('__disclaimer_closed', renderHist);
+}
+</script>
+</body>
+</html>
