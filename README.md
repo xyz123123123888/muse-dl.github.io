@@ -186,3 +186,12 @@ python -m playwright install chromium
 - [Muse AI](https://www.muse.ai/) — 平台本身
 - [waitress](https://docs.pylonsproject.org/projects/waitress/) — 生产级 WSGI
 - `bc/1.txt` `bc/2.txt` — 法务参考来源 (项目作者自拟)
+
+---
+
+> 小话
+> - 其实这个工具刚开发出来有一定的违规性😭
+> - 我只是希望分享学习才开源的……
+> - 推荐还是自己用用就行了 {{(>_<)}}
+> - 不要去下载别人的歌！！！
+> - (还有, 我自从上传将不再维护, 我可不想因为这个小项目就进去了QaQ)
