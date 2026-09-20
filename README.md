@@ -69,7 +69,8 @@ python -m http.server 8000
 ## 特性
 
 - **终端复古风** — 磷光绿 `#00ff41` + CRT 扫描线 + 边缘暗角 + 等宽字体 + 闪烁光标
-- **浏览器内打包** — JSZip 直接在页面里打成 zip (`mp3` + `cover.jpg` + `lrc` + `info.json` + `README.txt`), 不下到任何服务器
+- **浏览器内打包** — JSZip 直接在页面里打成 zip (`音频` + `cover.jpg` + `lrc` + `info.json` + `README.txt`), 不下到任何服务器
+- **自动识别 Opus 并转码** — 2026-09 起部分新曲是 "MP4容器+Opus" 伪装成 .m4a; 工具按文件真实内容嗅探, 用 WebCodecs 编成 AAC (兼容一切播放器), 降级 WAV, 并**保留原始 Opus** 双文件输出
 - **强约束免责弹窗** — 必须**滚动到底部**才启用勾选, 勾选后 `localStorage` **永久记录**, 不再重弹
 - **Rickroll 彩蛋** — 拒绝协议有一定概率跳转到 B 站经典视频哦~ (透露: BV********VH)
 - **会话内历史** — 元数据存 `localStorage`, Blob 留缓存 (一般刷新后失效, 等价于"3 天过期")
@@ -102,17 +103,25 @@ python -m http.server 8000
 
 ---
 
-## 技术细节 (CORS 可行性)
+## 技术细节 (CORS 可行性 + 音频格式)
 
 静态版能跑通的关键是 **Muse 的 API + 音频 + 图片资源都允许浏览器跨域 fetch** (`Access-Control-Allow-Origin: *`):
 
 | 资源类型 | 来源 | 跨域状态 |
 |---|---|---|
 | 元数据 API | `https://project-api.atmob.com/.../song/info` | 允许 |
-| mp3 音频 | `*.cos.ap-*.myqcloud.com` (腾讯云 COS) | 允许 |
+| 音频 | `https://cdn-work.muse.top/work/audio/{workId}.m4a` | 允许 |
 | 封面图片 | 平台 CDN | 允许 |
 
-这意味着用户浏览器可以**直接 `fetch` 拿到 mp3 二进制**, 用 `JSZip` 在页面内打 zip, 然后 `URL.createObjectURL` + `<a download>` 触发下载, 全程不经过任何第三方代理。
+**⚠️ 音频格式坑 (2026-09 平台更新)**: 部分新曲的音频实际是 **MP4 容器 + Opus 编码**, 但 URL 后缀是 `.m4a`。
+浏览器原生支持 Opus 所以网页能播; 但多数桌面播放器按 `.m4a` 期望 AAC, 遇到 Opus 轨道会拒播/误报"非 mp3"——看起来像"加密"了, 实际没有 DRM。
+
+因此工具**不信任 URL**, 按字节内容嗅探真实编码 (`stsd` 里的 codec 字段), 然后:
+
+- **静态版 (index.html)**: 浏览器原生解码 (`decodeAudioData`) → WebCodecs `AudioEncoder` 编 AAC (`mp4a.40.2`) + mp4-muxer 封装为 `.m4a`; 若 WebCodecs 不可用则降级为 **WAV** (零依赖, 兼容一切); 再不行就保留原始 Opus。zip 内**双文件**: `标题.m4a` (AAC 主文件) + `标题_opus_orig.m4a` (原始保留)。
+- **Python 版 (app.py)**: 服务端 ffmpeg 转 AAC (128k, faststart), 同样保留原始 + 时长比对校验 (偏差 < 2s 才采用)。
+
+「检验」= 转码产物再用浏览器/ffmpeg 真实解码一遍, 确认时长与原始一致且能正常解码, 确保下载的文件**一定能播**。
 
 ---
 
@@ -122,11 +131,12 @@ python -m http.server 8000
 > **此版本在服务端发起抓取**, 部署请注意: 你的 IP 会向 Muse 平台发起请求, 可能违反其 ToS。
 > 仅推荐**个人内网自部署**做研究和备份用。
 
-Python 版内嵌了同一份 HTML (逻辑与静态版完全一致), 优势是:
+Python 版内嵌了同一份 HTML (逻辑与静态版完全一致, 含"滚动到底部"免责弹窗), 优势是:
 
 - **双层抓取** — `requests` 主路失败时自动回退到 Playwright 真实打开页面
 - **磁盘持久化** — zip 落到 `downloads/`, 3 天后自动清理
 - **任务调度** — 信号量限流 + 同 work_id 去重 + 进度加权
+- **服务端转码** — 自动检测 Opus → ffmpeg 转 AAC, 校验后与原始文件一起打进 zip
 
 ### 启动
 
@@ -145,8 +155,6 @@ python app.py
 ```bash
 python -m playwright install chromium
 ```
-
-> 注意: Python 版的免责弹窗用的是早期版本 (`sessionStorage` 3 分钟), 不带"滚动到底部"逻辑, 也不引用 `bc/1.txt`。如果你 fork 了这个仓库, 想统一体验, 可以用 `index.html` 替换 `app.py` 启动后的内嵌 HTML。
 
 ---
 

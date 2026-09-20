@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import threading
 import time
 import traceback
@@ -70,6 +72,17 @@ COMMON_HEADERS = {
 
 # muse.top 内部 API 端点 (从 H5 页面 JS 拦截得到)
 MUSE_SONG_INFO_URL = "https://project-api.atmob.com/project/song/v30/song/info"
+# 逐句时间轴接口 (startS/endS), 用于生成真·LRC。缺失时静默降级为纯文本歌词。
+MUSE_TIMELINE_URL = "https://project-api.atmob.com/project/song/v30/song/timeline/info"
+
+# ffmpeg 定位: 环境变量 > 继承的 PATH > 常见自带安装位置 (如 Live2D Cubism 自带的)
+# 注意: 如果 TraeCode/Python 进程启动早于系统环境变量变更, 要用 MUSE_DL_FFMPEG 显式指定
+FFMPEG_CANDIDATES = [
+    os.environ.get("MUSE_DL_FFMPEG") or "",
+    shutil.which("ffmpeg") or "",
+    r"C:\Program Files\Live2D Cubism 5.3\tools\ffmpeg\ffmpeg.exe",
+]
+FFMPEG = next((p for p in FFMPEG_CANDIDATES if p and Path(p).is_file()), None)
 
 # 触发 H5 页面 JS 发出 API 请求所需的 "客户端标识"
 # (从抓包看到 — 平台似乎只校验 referer, 不严格校验 machineId)
@@ -147,9 +160,11 @@ def guess_ext(url: str, content_type: str = "") -> str:
         "audio/mp3": ".mp3",
         "audio/mp4": ".m4a",
         "audio/x-m4a": ".m4a",
+        "audio/aac": ".aac",
+        "audio/ogg": ".ogg",
+        "audio/opus": ".opus",
         "audio/flac": ".flac",
         "audio/x-flac": ".flac",
-        "audio/ogg": ".ogg",
         "audio/wav": ".wav",
         "audio/x-wav": ".wav",
         "image/jpeg": ".jpg",
@@ -158,6 +173,192 @@ def guess_ext(url: str, content_type: str = "") -> str:
         "image/webp": ".webp",
         "image/gif": ".gif",
     }.get(ct, "")
+
+
+# ============== 音频格式嗅探 / 转码 / 校验 ==============
+# 背景: 2026-09 前后 Muse 平台部分新曲音频开始使用 "MP4 容器 + Opus 编码" 输出,
+# 但 URL 后缀仍是 .m4a。浏览器原生支持 Opus 所以网页能播; 多数播放器按 .m4a 期望
+# AAC, 遇到 Opus 轨道会拒播/误报"非mp3"。因此下载后必须按文件真实内容判定格式,
+# 并对 Opus 用 ffmpeg 转成 AAC, 同时保留原始文件 + 校验转码结果。
+
+
+def _parse_mp4_track(path: Path) -> Optional[dict]:
+    """
+    读取 MP4/QuickTime 文件的轨道信息 (不需要完整解析 box 树)。
+    返回 {codec, duration, timescale} 或 None。
+    stsd 里的 codec 字段位于 'stsd' 标签后: [size(4) 'stsd' ver/flags(4) entry_count(4) 形式]
+    主轨道格式名在其后 4 字节; Opus 会带 'dOps' 段, AAC 是 'mp4a'。
+    """
+    size = path.stat().st_size
+    # moov 通常在文件尾部 (非 faststart), 读最后 512KB + 开头 64KB 就够定位
+    tail_bytes = min(size, 512 * 1024)
+    with open(path, "rb") as f:
+        head = f.read(64 * 1024)
+        f.seek(size - tail_bytes)
+        tail = f.read()
+    data = head + tail
+    i = data.find(b"stsd")
+    if i < 0:
+        return None
+    # stsd 后: version/flags(4) + entry_count(4) = 8 字节偏移
+    fmt = data[i + 16:i + 20]
+    codec = fmt.decode("latin1", "replace") if len(fmt) == 4 else ""
+    # mdhd 布局 (相对 'mdhd' type 偏移):
+    #   v0: ver/flags(+4) creation(+8) modification(+12) timescale(+16) duration(+20) lang(+24) pre(+26)
+    #   v1: ver/flags(+4) creation(+8,64bit) modification(+16,64bit) timescale(+24) duration(+28,64bit)
+    m = data.find(b"mdhd")
+    duration = timescale = None
+    if m >= 0:
+        ver = data[m + 4]
+        if ver == 0:
+            timescale = int.from_bytes(data[m + 16:m + 20], "big")
+            duration = int.from_bytes(data[m + 20:m + 24], "big")
+        else:
+            timescale = int.from_bytes(data[m + 24:m + 28], "big")
+            duration = int.from_bytes(data[m + 28:m + 36], "big")
+    return {"codec": codec, "duration": duration, "timescale": timescale}
+
+
+def inspect_audio(path: Path) -> dict:
+    """
+    判定音频文件真实编码与容器, 返回:
+      {container, codec, encoding, duration}
+    encoding: mp3 | aac | opus | mp4a | unknown (用于决定扩展名与是否转码)
+    """
+    with open(path, "rb") as f:
+        head = f.read(32)
+    if head[:3] == b"ID3" or (head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+        return {"container": "mp3", "codec": "mp3", "encoding": "mp3", "duration": None}
+    if head[:2] in (b"\xff\xf1", b"\xff\xf9"):
+        return {"container": "adts", "codec": "aac", "encoding": "aac", "duration": None}
+    if head[4:8] == b"ftyp":
+        t = _parse_mp4_track(path) or {}
+        codec = (t.get("codec") or "").lower()
+        if codec == "opus":
+            enc = "opus"
+        elif codec == "mp4a":
+            enc = "mp4a"
+        elif codec:
+            enc = codec
+        else:
+            enc = "unknown"
+        dur = None
+        if t.get("duration") and t.get("timescale"):
+            dur = t["duration"] / t["timescale"]
+        return {"container": "mp4", "codec": t.get("codec", ""), "encoding": enc,
+                "duration": dur}
+    return {"container": "unknown", "codec": "", "encoding": "unknown", "duration": None}
+
+
+def transcode_to_aac(src: Path, dst: Path, time_budget_ms: int = 180000) -> bool:
+    """用 ffmpeg 把任意输入转成 AAC (faststart), 成功且输出非空返回 True。"""
+    if not FFMPEG:
+        log.warning("未找到 ffmpeg, 跳过 Opus→AAC 转换")
+        return False
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+           "-i", str(src), "-vn", "-c:a", "aac", "-b:a", "128k",
+           "-movflags", "+faststart", str(dst)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=time_budget_ms // 1000)
+        if r.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+            return True
+        log.warning("ffmpeg 转码失败: rc=%s stderr=%s", r.returncode, r.stderr[-300:])
+    except Exception as e:
+        log.warning("ffmpeg 转码异常: %s", e)
+    return False
+
+
+def verify_audio_pair(orig: Path, new: Path, tolerance_sec: float = 2.0) -> Optional[str]:
+    """
+    校验转码产物: 结构可解析 + 编码为 AAC + 时长与原始基本一致。
+    返回 None 表示通过, 否则返回错误描述。
+    """
+    ni = inspect_audio(new)
+    if not ni or ni.get("container") != "mp4" or ni.get("codec", "").lower() != "mp4a":
+        return f"转码产物不是 AAC 轨道 (读到: {ni.get('codec') or '未知'})"
+    oi = inspect_audio(orig)
+    if oi.get("duration") and ni.get("duration"):
+        if abs(oi["duration"] - ni["duration"]) > tolerance_sec:
+            return f"时长不一致: 原始 {oi['duration']:.1f}s → 转码 {ni['duration']:.1f}s"
+    return None
+
+
+def audio_display_ext(info: dict) -> str:
+    """按真实编码决定 zip 内的扩展名。"""
+    return {
+        "mp3": ".mp3",
+        "aac": ".aac",
+        "opus": ".m4a",   # 容器仍是 MP4, 后缀用 .m4a
+        "mp4a": ".m4a",
+        "flac": ".flac",
+        "ogg": ".ogg",
+        "opus_ogg": ".opus",
+    }.get(info.get("encoding", ""), ".m4a")
+
+
+def _fmt_lrc_time(sec: float) -> str:
+    """把秒数格式化成 LRC 时间戳 [mm:ss.xx]。"""
+    try:
+        sec = max(0.0, float(sec))
+    except (TypeError, ValueError):
+        sec = 0.0
+    minutes = int(sec // 60)
+    seconds = sec - minutes * 60
+    return f"[{minutes:02d}:{seconds:05.2f}]"
+
+
+def build_lrc(timeline: Optional[list], title: str = "", artist: str = "") -> str:
+    """
+    把 timeline/info 的 list 转成标准 LRC 文本。
+    timeline 每项形如 {"word": "...", "startS": 12.048, "endS": 14.441}。
+    没有时间轴时返回空串, 由调用方决定是否用纯文本歌词兜底。
+    """
+    if not timeline:
+        return ""
+    lines: list[str] = []
+    if title:
+        lines.append(f"[ti:{title}]")
+    if artist:
+        lines.append(f"[ar:{artist}]")
+    lines.append("[by:muse-dl]")
+    for item in timeline:
+        if not isinstance(item, dict):
+            continue
+        word = (item.get("word") or "").strip()
+        if not word:
+            continue
+        start = item.get("startS")
+        if start is None:
+            continue
+        # 逐句模式下 word 里可能带换行, 拆成多行共用一个时间戳
+        for piece in word.splitlines():
+            piece = piece.strip()
+            # 跳过 [Unknown] / [unknown] 之类的占位标记, 它们不是歌词正文
+            if not piece or piece.startswith("[") and piece.endswith("]"):
+                continue
+            lines.append(f"{_fmt_lrc_time(start)}{piece}")
+    return "\n".join(lines) + "\n"
+
+
+def fetch_timeline(work_id: str) -> Optional[list]:
+    """
+    拉逐句时间轴。任何异常都返回 None, 不影响主流程 (歌词降级为纯文本)。
+    """
+    payload = dict(MUSE_CLIENT_PAYLOAD, workId=work_id, machineId=uuid.uuid4().hex)
+    try:
+        r = requests.post(
+            MUSE_TIMELINE_URL, json=payload, headers=COMMON_HEADERS, timeout=15
+        )
+        r.raise_for_status()
+        j = r.json()
+        if j.get("code") != 0:
+            log.warning("timeline 接口返回非成功: code=%s", j.get("code"))
+            return None
+        return (j.get("data") or {}).get("list") or None
+    except Exception as e:
+        log.warning("timeline 拉取失败 (歌词降级为纯文本): %s", e)
+        return None
 
 
 # ============== 抓取: requests 主路 ==============
@@ -185,16 +386,25 @@ def fetch_via_requests(work_id: str) -> dict:
     if not image_urls and tpl.get("imageUrl"):
         image_urls.append(tpl["imageUrl"])
 
+    title = info.get("title") or tpl.get("title") or work_id
+    user_name = user.get("userName") or user.get("nickname") or ""
+
+    # 逐句时间轴 → 真·LRC (失败则降级为纯文本歌词)
+    timeline = fetch_timeline(work_id)
+    lrc_text = build_lrc(timeline, title=title, artist=user_name)
+
     return {
         "work_id": work_id,
-        "title": info.get("title") or tpl.get("title") or work_id,
+        "title": title,
         "duration": info.get("duration"),
         "audio_url": audio_url,
         "image_urls": image_urls,
         "lyrics": info.get("lyrics") or "",
+        "lrc_text": lrc_text,
         "introduction": info.get("introduction") or "",
-        "user_name": user.get("userName") or user.get("nickname") or "",
-        "extra": {"songInfo": info, "songTemplateInfo": tpl, "userInfo": user},
+        "user_name": user_name,
+        "extra": {"songInfo": info, "songTemplateInfo": tpl, "userInfo": user,
+                  "timeline": timeline},
     }
 
 
@@ -379,17 +589,45 @@ def build_zip(task_dir: Path, meta: dict, file_id: str, on_progress=None) -> tup
         sub_total = 1 + n_images_to_try  # 1 音乐 + N 图片
         sub_idx = 0
 
-        # 1) 音乐
+        # 1) 音乐 — 下载后按真实内容判定格式; Opus 需要转 AAC (平台新曲是 MP4+Opus)
         audio_path: Optional[Path] = None
+        audio_info: dict = {"encoding": "unknown", "codec": "", "container": ""}
+        transcode_ok: Optional[bool] = None
+        transcode_note = ""
         if not audio_url:
             raise RuntimeError("没有 audio_url, 无法下载音乐")
-        ext = guess_ext(audio_url, "") or ".mp3"
-        audio_path = task_dir / f"song{ext}"
+        audio_path = task_dir / "song_dl.bin"          # 先用中性名, 嗅探完再定后缀
         sub_idx += 1
         if on_progress:
-            on_progress(f"下载音乐 {audio_path.name}", 0.45 + 0.45 * (sub_idx / sub_total))
+            on_progress("下载音乐", 0.45 + 0.45 * (sub_idx / sub_total))
         n = _http_download(audio_url, audio_path)
         log.info("音频下载完成: %s (%d bytes)", audio_path, n)
+        audio_info = inspect_audio(audio_path)
+        log.info("音频格式判定: %s", audio_info)
+        issue_op = "fmt=failed"
+        prod_audio = audio_path       # zip 主音频文件
+        prod_ext = audio_display_ext(audio_info)
+        if audio_info.get("encoding") == "opus":
+            issue_op = "fmt=opus"
+            if on_progress:
+                on_progress("转换音频为 AAC (Opus→AAC)", 0.55)
+            aac_candidate = task_dir / "song_aac.m4a"
+            if transcode_to_aac(audio_path, aac_candidate):
+                err = verify_audio_pair(audio_path, aac_candidate)
+                if err:
+                    transcode_note = f"转码校验未通过: {err}"
+                    log.warning("Opus→AAC 校验失败: %s", err)
+                    transcode_ok = False
+                else:
+                    transcode_ok = True
+                    prod_audio = aac_candidate
+                    prod_ext = ".m4a"
+                    log.info("Opus→AAC 转换+校验通过")
+            else:
+                transcode_ok = False
+                transcode_note = "ffmpeg 不可用或转换失败, 已保留原始 Opus 文件"
+        elif audio_info.get("encoding") in ("mp3", "aac", "mp4a", "opus_ogg", "ogg", "flac"):
+            issue_op = f"fmt={audio_info['encoding']}"
 
         # 2) 封面图
         image_paths: list[Path] = []
@@ -405,10 +643,14 @@ def build_zip(task_dir: Path, meta: dict, file_id: str, on_progress=None) -> tup
             except Exception as e:
                 log.warning("图片下载失败 (继续) %s: %s", img_url[:80], e)
 
-        # 3) 歌词 (如果有非空 lyrics)
+        # 3) 歌词 — 优先用真·LRC (带时间轴), 无时间轴时降级为纯文本 .lrc
         lyrics_path: Optional[Path] = None
+        lrc_text = (meta.get("lrc_text") or "").strip()
         lyrics_text = (meta.get("lyrics") or "").strip()
-        if lyrics_text:
+        if lrc_text:
+            lyrics_path = task_dir / "lyrics.lrc"
+            lyrics_path.write_text(lrc_text, encoding="utf-8")
+        elif lyrics_text:
             # 简单存成 .lrc 格式 (没时间轴也是合法 lrc)
             lyrics_path = task_dir / "lyrics.lrc"
             header = f"[ti:{meta.get('title','')}]\n[ar:{meta.get('user_name','')}]\n"
@@ -416,6 +658,16 @@ def build_zip(task_dir: Path, meta: dict, file_id: str, on_progress=None) -> tup
 
         # 4) info.json
         info_path = task_dir / "info.json"
+        # 组装音频说明 (给用户/工具看)
+        audio_note = {
+            "url": audio_url,
+            "encoding": audio_info.get("encoding"),
+            "codec": audio_info.get("codec"),
+            "container": audio_info.get("container"),
+            "duration_sec": audio_info.get("duration"),
+            "transcoded": transcode_ok is True,
+            "transcode_note": transcode_note,
+        }
         info_path.write_text(
             json.dumps({
                 "work_id": meta.get("work_id"),
@@ -423,7 +675,9 @@ def build_zip(task_dir: Path, meta: dict, file_id: str, on_progress=None) -> tup
                 "user_name": meta.get("user_name"),
                 "duration_sec": meta.get("duration"),
                 "introduction": meta.get("introduction"),
+                "has_timed_lyrics": bool(lrc_text),
                 "audio_url": audio_url,
+                "audio": audio_note,
                 "image_urls": image_urls,
                 "source": meta.get("source", ""),
                 "fetched_at": datetime.now().isoformat(timespec="seconds"),
@@ -437,10 +691,19 @@ def build_zip(task_dir: Path, meta: dict, file_id: str, on_progress=None) -> tup
             on_progress("打包 zip", 0.95)
         zip_name = f"muse_{meta['work_id'][:8]}_{file_id}.zip"
         zip_path = DOWNLOADS_DIR / zip_name
+
+        # 主音频: 转码成功用 AAC, 否则原始文件 (命名按真实编码定后缀)
+        def m4a_ext_orig() -> str:
+            return ".m4a" if audio_info.get("container") == "mp4" else audio_display_ext(audio_info)
+
+        arc_files: list[tuple[Path, str]] = [(prod_audio, f"{title_safe}{prod_ext}")]
+        if transcode_ok and os.path.abspath(prod_audio) != os.path.abspath(audio_path):
+            # 保留原始 Opus 文件, 标注清楚, 供需要无损/原始的用户使用
+            arc_files.append((audio_path, f"{title_safe}_opus_orig{m4a_ext_orig()}"))
+
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            # 主要文件用歌名命名
-            arc_audio = f"{title_safe}{audio_path.suffix}"
-            zf.write(audio_path, arcname=arc_audio)
+            for src, arc in arc_files:
+                zf.write(src, arcname=arc)
             # 封面图
             for i, ip in enumerate(image_paths, 1):
                 zf.write(ip, arcname=f"cover_{i}{ip.suffix}")
@@ -449,16 +712,34 @@ def build_zip(task_dir: Path, meta: dict, file_id: str, on_progress=None) -> tup
                 zf.write(lyrics_path, arcname=f"{title_safe}.lrc")
             # 元数据始终放在根
             zf.write(info_path, arcname="info.json")
-            # README
+            # README — 说明两个音频文件与编码状态
             readme = (
                 f"标题: {meta.get('title','')}\n"
                 f"作者: {meta.get('user_name','')}\n"
                 f"时长: {meta.get('duration','')} 秒\n"
                 f"workId: {meta.get('work_id','')}\n"
                 f"简介: {meta.get('introduction','')}\n"
+                f"歌词: {'带时间轴 (LRC)' if lrc_text else ('纯文本' if lyrics_text else '无')}\n"
                 f"抓取来源: {meta.get('source','')}\n"
                 f"抓取时间: {datetime.now().isoformat(timespec='seconds')}\n"
+                f"\n"
+                f"音频编码: {audio_info.get('encoding') or '未知'}"
+                f" (容器: {audio_info.get('container') or '未知'}, codec: {audio_info.get('codec') or '未知'})\n"
             )
+            if transcode_ok:
+                readme += (
+                    f"已自动转换为 AAC (兼容性最好): {title_safe}{prod_ext}\n"
+                    f"同时保留原始文件: {arc_files[1][1]}\n"
+                    f"  - 原始文件为 OPUS 编码, 仅 Chrome/Edge/VLC/foobar/手机端等支持 Opus 的播放器可直接播放;\n"
+                    f"  - 普通桌面播放器/车载系统请使用 AAC 版本。\n"
+                )
+            elif transcode_note:
+                readme += f"注意: {transcode_note}\n"
+            if audio_info.get("encoding") == "opus" and not transcode_ok:
+                readme += (
+                    f"  - 本文件是 OPUS 编码 (MP4 容器), 网页可播但普通播放器可能拒绝;\n"
+                    f"  - 需要 AAC 版本请安装/配置 ffmpeg 后重试 (设置环境变量 MUSE_DL_FFMPEG 指向 ffmpeg.exe)。\n"
+                )
             zf.writestr("README.txt", readme)
 
         # 任务目录删掉原始文件 (zip 已包含), 省空间
@@ -1039,13 +1320,28 @@ INDEX_HTML = r"""<!doctype html>
     letter-spacing: 0.5px;
     text-shadow: none;
   }
-  .modal-body { padding: 16px 20px 6px; font-size: 13px; }
+  .modal-body { padding: 16px 20px 6px; font-size: 13px; max-height: 60vh; overflow-y: auto; }
   .modal-body p { margin: 0 0 10px; color: var(--warn); font-weight: 600; }
-  .modal-body ul {
+  .modal-body ol {
     list-style: none; padding: 0; margin: 0 0 12px;
-    color: var(--fg-dim); line-height: 1.7;
+    color: var(--fg-dim); line-height: 1.7; counter-reset: agreement;
   }
-  .modal-body ul li::before { content: "* "; color: var(--fg-mute); }
+  .modal-body ol li {
+    counter-increment: agreement;
+    padding-left: 1.6em;
+    position: relative;
+    margin: 4px 0;
+  }
+  .modal-body ol li::before {
+    content: "[" counter(agreement) "] ";
+    color: var(--fg-mute);
+    position: absolute; left: 0;
+  }
+  .modal-body .scroll-hint {
+    color: var(--fg-mute); font-size: 11px; font-style: italic;
+    text-align: center; margin: 8px 0 0; text-shadow: none;
+  }
+  .modal-body .scroll-hint.dismissed { display: none; }
   .check-row {
     display: flex; align-items: flex-start; gap: 8px;
     margin: 12px 0 0;
@@ -1079,27 +1375,31 @@ INDEX_HTML = r"""<!doctype html>
 </style>
 </head>
 <body>
-<!-- 免责协议弹窗: 首次或 3 分钟过期后弹出, 必须勾选同意后关闭 -->
+<!-- 免责协议弹窗: 必须滚动到底部才能勾选; 同意后 localStorage 永久记录, 不再重弹 -->
 <div class="modal-overlay" id="modalOverlay">
   <div class="modal">
     <div class="modal-header">[!] ALERT :: USE FOR LEARNING & TECHNICAL STUDY ONLY</div>
-    <div class="modal-body">
-      <p>本工具仅供学习与技术交流使用, 严禁用于任何非法用途。</p>
-      <ul>
-        <li>本项目仅用于<strong>学习技术原理</strong>, 不提供任何形式的打包发布服务。</li>
-        <li>所有从第三方平台下载的内容, 其版权归原作者或平台所有, 请自行遵守平台的使用条款与相关法律法规。</li>
-        <li>您不得将下载的文件用于商业传播、二次分发、二次创作牟利、侵犯他人权益等任何非法或不当用途。</li>
-        <li>使用本工具造成的一切后果由使用者本人承担, 项目作者不承担任何法律责任。</li>
-        <li>如您所在地区的法律法规不允许此类操作, 请立即停止使用并关闭本页面。</li>
-      </ul>
+    <div class="modal-body" id="modalBody">
+      <p>重要提示: 请仔细阅读并确认后使用。</p>
+      <p>本工具仅供您下载<strong>自己</strong>使用 Muse AI 创作的音乐。在继续之前, 您必须确认并承诺以下事项:</p>
+      <ol>
+        <li><strong>您拥有完整权利</strong>: 您即将下载的音乐, 是由您本人使用 Muse AI 创作, 您拥有该作品的全部合法权利, 包括著作权。</li>
+        <li><strong>您不会用于侵权</strong>: 您不会利用本工具下载任何他人的、未经授权的、或侵犯第三方合法权益 (包括但不限于著作权、商标权、隐私权) 的音乐内容。</li>
+        <li><strong>您知晓官方渠道</strong>: 本工具并非 Muse AI 官方产品。我们强烈建议您直接使用 Muse AI 官方渠道下载您创作的音乐。Muse AI 官方联系方式: duliang@atmob.com。</li>
+        <li><strong>您自愿承担风险</strong>: 任何因您违反上述承诺、不当使用本工具所产生的一切法律后果与风险, 均由您本人完全承担, 本工具及开发者不承担任何责任。</li>
+        <li><strong>您知晓寻求帮助的途径</strong>: 如遇知识产权争议, 您可以联系开发者 tnt111h111@gmail.com, 或拨打国家法律咨询热线 12348 获取专业指导。</li>
+      </ol>
+      <p>我已逐条阅读、充分理解并郑重承诺遵守以上所有条款。</p>
+      <div class="scroll-hint" id="scrollHint">&gt; 请向下滚动到底部以激活同意选项 &lt;</div>
       <label class="check-row">
-        <input type="checkbox" id="agreeCheck" onchange="onAgreeChange()" onclick="onAgreeChange()">
-        <span>我已完整阅读并同意以上条款, 承诺仅将本工具用于合法的学习交流用途。</span>
+        <input type="checkbox" id="agreeCheck" disabled onchange="onAgreeChange()" onclick="onAgreeChange()">
+        <span>我同意并承诺遵守上述条款</span>
       </label>
+      <div class="modal-spacer" aria-hidden="true" style="height: 200px; min-height: 200px; flex-shrink: 0;"></div>
     </div>
     <div class="modal-actions">
       <button class="btn-cancel" id="rejectBtn" type="button" onclick="onReject()">[ REJECT ]</button>
-      <button class="btn-accept" id="acceptBtn" type="button" disabled onclick="onAccept()">[ ACCEPT ]</button>
+      <button class="btn-accept" id="acceptBtn" type="button" disabled onclick="onAccept()">[ CONFIRM ]</button>
     </div>
   </div>
 </div>
@@ -1112,7 +1412,7 @@ INDEX_HTML = r"""<!doctype html>
                                         <span class="cursor"></span></pre>
 
   <div class="banner">
-    <span>muse-dl v0.1.0</span><span class="dot">::</span>
+    <span>muse-dl v0.2.0</span><span class="dot">::</span>
     <span>h5.muse.top song scraper</span><span class="dot">::</span>
     <span>keep 72h</span><span class="dot">::</span>
     <span>2 concurrent</span>
@@ -1153,7 +1453,10 @@ window.syncAcceptBtn = function() {
 window.closeModal = function() {
   const o = document.getElementById('modalOverlay');
   if (o) o.style.display = 'none';
-  try { sessionStorage.setItem('muse_dl_disclaimer_shown', String(Date.now())); } catch (_) {}
+  try {
+    localStorage.setItem('muse-tool-agreed', 'yes');
+    localStorage.setItem('muse-tool-agreed-time', new Date().toISOString());
+  } catch (_) {}
   window.dispatchEvent(new Event('__disclaimer_closed'));
 };
 
@@ -1190,17 +1493,57 @@ window.onReject = function() {
 };
 
 window.__initDisclaimer = function() {
+  // 永久记录: 之前同意过则直接跳过
   let skip = false;
   try {
-    const shown = parseInt(sessionStorage.getItem('muse_dl_disclaimer_shown') || "0", 10);
-    if (shown && (Date.now() - shown) < 3 * 60 * 1000) skip = true;
+    if (localStorage.getItem('muse-tool-agreed') === 'yes') skip = true;
   } catch (_) {}
   const o = document.getElementById('modalOverlay');
   if (skip) {
     if (o) o.style.display = 'none';
     window.__disclaimer_skipped = true;
     window.dispatchEvent(new Event('__disclaimer_closed'));
+    return;
   }
+  // 滚动检测: modal-body 滚到底部才启用勾选
+  const body = document.getElementById('modalBody');
+  const check = document.getElementById('agreeCheck');
+  const hint = document.getElementById('scrollHint');
+  const spacer = document.querySelector('.modal-spacer');
+  let unlocked = false;
+  const doUnlock = () => {
+    if (unlocked) return;
+    unlocked = true;
+    check.disabled = false;
+    if (hint) hint.classList.add('dismissed');
+    window.syncAcceptBtn();
+  };
+  if (body && check) {
+    // 方案 A (最健壮): 用 IntersectionObserver 监听底部 spacer 是否露出
+    if (spacer && 'IntersectionObserver' in window) {
+      const io = new IntersectionObserver((entries) => {
+        for (const en of entries) {
+          if (en.isIntersecting) { doUnlock(); io.disconnect(); }
+        }
+      }, { root: body, threshold: 0.01 });
+      io.observe(spacer);
+    }
+    // 方案 B (兜底): scroll 事件 + 容差判定
+    const onScroll = () => {
+      if (body.scrollHeight <= body.clientHeight + 1) { doUnlock(); return; }
+      if (body.scrollTop + body.clientHeight >= body.scrollHeight - 8) doUnlock();
+    };
+    body.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onScroll);
+    // 方案 C (最终兜底): 定时轮询, 处理内容不溢出 / 事件不触发等边界情况
+    onScroll();
+    let tries = 0;
+    const t = setInterval(() => {
+      onScroll();
+      if (unlocked || ++tries >= 20) clearInterval(t);
+    }, 250);
+  }
+  window.syncAcceptBtn();
 };
 window.__initDisclaimer();
 

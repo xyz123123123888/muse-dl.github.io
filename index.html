@@ -400,7 +400,7 @@
                                         <span class="cursor"></span></pre>
 
   <div class="banner">
-    <span>muse-dl v0.2.0</span><span class="dot">::</span>
+    <span>muse-dl v0.3.0</span><span class="dot">::</span>
     <span>static, client-side, no backend</span><span class="dot">::</span>
     <span>h5.muse.top scraper</span>
   </div>
@@ -498,18 +498,39 @@ window.__initDisclaimer = function() {
   const body = document.getElementById('modalBody');
   const check = document.getElementById('agreeCheck');
   const hint = document.getElementById('scrollHint');
+  const spacer = document.querySelector('.modal-spacer');
+  let unlocked = false;
+  const doUnlock = () => {
+    if (unlocked) return;
+    unlocked = true;
+    check.disabled = false;
+    if (hint) hint.classList.add('dismissed');
+    window.syncAcceptBtn();
+  };
   if (body && check) {
+    // 方案 A (最健壮): 用 IntersectionObserver 监听底部 spacer 是否露出
+    if (spacer && 'IntersectionObserver' in window) {
+      const io = new IntersectionObserver((entries) => {
+        for (const en of entries) {
+          if (en.isIntersecting) { doUnlock(); io.disconnect(); }
+        }
+      }, { root: body, threshold: 0.01 });
+      io.observe(spacer);
+    }
+    // 方案 B (兜底): scroll 事件 + 容差判定
     const onScroll = () => {
-      // 5px 容差
-      if (body.scrollTop + body.clientHeight >= body.scrollHeight - 5) {
-        check.disabled = false;
-        if (hint) hint.classList.add('dismissed');
-        body.removeEventListener('scroll', onScroll);
-      }
+      if (body.scrollHeight <= body.clientHeight + 1) { doUnlock(); return; }
+      if (body.scrollTop + body.clientHeight >= body.scrollHeight - 8) doUnlock();
     };
-    body.addEventListener('scroll', onScroll);
-    // 内容不溢出时直接启用 (短协议 / 小窗口)
-    if (body.scrollHeight <= body.clientHeight + 1) onScroll();
+    body.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onScroll);
+    // 方案 C (最终兜底): 定时轮询, 处理内容不溢出 / 事件不触发等边界情况
+    onScroll();
+    let tries = 0;
+    const t = setInterval(() => {
+      onScroll();
+      if (unlocked || ++tries >= 20) clearInterval(t);
+    }, 250);
   }
   window.syncAcceptBtn();
 };
@@ -517,6 +538,7 @@ window.__initDisclaimer();
 
 // ===== 业务 (静态版, 无后端) =====
 const API_URL = 'https://project-api.atmob.com/project/song/v30/song/info';
+const TIMELINE_URL = 'https://project-api.atmob.com/project/song/v30/song/timeline/info';
 const CLIENT_PAYLOAD_BASE = {
   appPlatform: 3,
   packageName: 'com.xingchat.land.muse',
@@ -595,6 +617,57 @@ function extractWorkId(url) {
   return m[1];
 }
 
+// 把秒数格式化成 LRC 时间戳 [mm:ss.xx]
+function fmtLrcTime(sec) {
+  const s = Math.max(0, Number(sec) || 0);
+  const m = Math.floor(s / 60);
+  const r = s - m * 60;
+  return '[' + String(m).padStart(2, '0') + ':' + r.toFixed(2).padStart(5, '0') + ']';
+}
+
+// 用 timeline 生成标准 LRC; 无数据返回空串
+function buildLrc(timeline, title, artist) {
+  if (!Array.isArray(timeline) || !timeline.length) return '';
+  const lines = [];
+  if (title)  lines.push('[ti:' + title + ']');
+  if (artist) lines.push('[ar:' + artist + ']');
+  lines.push('[by:muse-dl]');
+  for (const item of timeline) {
+    if (!item || typeof item !== 'object') continue;
+    const word = String(item.word || '').trim();
+    if (!word) continue;
+    const start = item.startS;
+    if (start == null) continue;
+    for (const piece of word.split(/\r?\n/)) {
+      const p = piece.trim();
+      // 跳过 [Unknown] 之类的占位标记
+      if (!p || (p.startsWith('[') && p.endsWith(']'))) continue;
+      lines.push(fmtLrcTime(start) + p);
+    }
+  }
+  return lines.join('\n') + '\n';
+}
+
+// 拉逐句时间轴 (失败返回 null, 歌词降级为纯文本)
+async function fetchTimeline(workId) {
+  try {
+    const r = await fetch(TIMELINE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({}, CLIENT_PAYLOAD_BASE, {
+        workId, machineId: randomHex(16),
+      })),
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (j.code !== 0) return null;
+    return (j.data && j.data.list) || null;
+  } catch (e) {
+    console.warn('timeline failed (lyrics fallback to plain text):', e);
+    return null;
+  }
+}
+
 // 抓元数据
 async function fetchMetadata(workId) {
   const payload = Object.assign({}, CLIENT_PAYLOAD_BASE, {
@@ -617,15 +690,19 @@ async function fetchMetadata(workId) {
     if (u && !images.includes(u)) images.push(u);
   }
   if (!images.length && tpl.imageUrl) images.push(tpl.imageUrl);
+  const title = info.title || tpl.title || workId;
+  const userName = user.userName || user.nickname || '';
+  const timeline = await fetchTimeline(workId);
   return {
     work_id: workId,
-    title: info.title || tpl.title || workId,
+    title,
     duration: info.duration,
     audio_url: info.audioUrl || '',
     image_urls: images,
     lyrics: info.lyrics || '',
+    lrc_text: buildLrc(timeline, title, userName),
     introduction: info.introduction || '',
-    user_name: user.userName || user.nickname || '',
+    user_name: userName,
   };
 }
 
@@ -699,13 +776,267 @@ function triggerDownload(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 1500);
 }
 
+// ---- 音频格式嗅探 / 浏览器内转码 / 校验 ----
+// 背景: 平台新曲是 "MP4 容器 + Opus 编码", URL 却是 .m4a。网页能播 (浏览器原生支持
+// Opus), 普通播放器却按 AAC 期望解析 → 拒播/误报"非mp3"。因此按文件真实内容判定格式,
+// Opus 用浏览器原生转码 (WebCodecs→AAC 或 WAV) 转 AAC/通用格式, 保留原始文件,
+// 并用 AudioContext 真实解码做"检验"。
+
+// 从字节内容嗅探 (不信任 URL): 返回 { ext, codec, encoding }
+function sniffAudioInfo(buf) {
+  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  // MP3: ID3 标签 或 MPEG 帧头
+  if (u8[0] === 0x49 && u8[1] === 0x44 && u8[2] === 0x33) return { ext: '.mp3', codec: 'mp3', encoding: 'mp3' };
+  if (u8[0] === 0xff && (u8[1] & 0xe0) === 0xe0) return { ext: '.mp3', codec: 'mp3', encoding: 'mp3' };
+  // ADTS AAC
+  if (u8[0] === 0xff && (u8[1] === 0xf1 || u8[1] === 0xf9)) return { ext: '.aac', codec: 'aac', encoding: 'aac' };
+  // MP4 容器: ftyp
+  if (String.fromCharCode(u8[4], u8[5], u8[6], u8[7]) === 'ftyp') {
+    // 找 stsd, 读首个 sample entry 的 4 字节格式名
+    const idx = findBytes(u8, [0x73, 0x74, 0x73, 0x64]); // 'stsd'
+    if (idx >= 0) {
+      const c = String.fromCharCode(u8[idx+16], u8[idx+17], u8[idx+18], u8[idx+19]);
+      if (c === 'Opus') return { ext: '.m4a', codec: 'Opus', encoding: 'opus' };
+      if (c === 'mp4a') return { ext: '.m4a', codec: 'mp4a', encoding: 'mp4a' };
+      if (c === 'encv' || c === 'enca') return { ext: '.m4a', codec: c, encoding: 'encrypted' };
+      return { ext: '.m4a', codec: c, encoding: c.toLowerCase() };
+    }
+    return { ext: '.m4a', codec: '', encoding: 'mp4' };
+  }
+  // 其它: 退回 URL 猜测
+  return null;
+}
+
+function findBytes(u8, pat) {
+  outer:
+  for (let i = 0; i + pat.length <= u8.length; i++) {
+    for (let j = 0; j < pat.length; j++) {
+      if (u8[i+j] !== pat[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+// 从 URL 猜后缀 (仅作 sniff 失败时的兜底; 新版音频是 .m4a)
+function audioExt(url) {
+  const m = String(url || '').split('?')[0].match(/\.([a-z0-9]{2,5})$/i);
+  if (m) return '.' + m[1].toLowerCase();
+  return '.m4a';
+}
+
+// ---- 浏览器内转码: WebCodecs 优先 (AAC, 无 wasm), AudioContext+WAV 兜底 ----
+// 2026-09 平台新曲音频是 "MP4容器 + Opus 编码", URL 却是 .m4a。
+// 网页能播 (浏览器原生 Opus), 普通播放器却按 AAC 解析 → 拒播/误报"非mp3"。
+// 因此: decodeAudioData 解码 → AudioEncoder 编 AAC + mp4-muxer 封装 (.m4a);
+//       若 WebCodecs 或 muxer 不可用 → 降级为 PCM→WAV (.wav, 兼容一切);
+//       仍失败 → 保留原始 Opus 文件, 不伪造扩展名。
+const MP4_MUXER_URLS = [
+  'https://unpkg.com/mp4-muxer@5.2.2/build/mp4-muxer.mjs',
+  'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs',
+];
+let _muxerModPromise = null;
+
+// 动态 import mp4-muxer (ESM, 纯 JS ~30KB), 多 CDN 降级
+function getMuxerMod() {
+  if (_muxerModPromise) return _muxerModPromise;
+  _muxerModPromise = (async () => {
+    let lastErr = null;
+    for (const u of MP4_MUXER_URLS) {
+      try { return await import(u); }
+      catch (e) { lastErr = e; console.warn('mp4-muxer load failed:', u, e.message); }
+    }
+    throw lastErr || new Error('mp4-muxer 加载失败');
+  })();
+  _muxerModPromise.catch(() => { _muxerModPromise = null; });
+  return _muxerModPromise;
+}
+
+// 把任意输入 (ArrayBuffer 或 TypedArray) 归一化成独立 ArrayBuffer (slice 拷贝, 避免 detach)
+function toArrayBuffer(buf) {
+  if (buf instanceof ArrayBuffer) return buf.slice(0);
+  if (ArrayBuffer.isView(buf)) return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  return new Uint8Array(buf).buffer.slice(0);
+}
+
+// 把原始音频解码成 AudioBuffer (浏览器原生 Opus 解码)。返回 null 表示浏览器不支持。
+function decodeToBuffer(buf) {
+  return new Promise((resolve) => {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      ctx.decodeAudioData(toArrayBuffer(buf), (ab) => { ctx.close && ctx.close(); resolve(ab); }, () => {
+        ctx.close && ctx.close(); resolve(null);
+      });
+    } catch (e) { resolve(null); }
+  });
+}
+
+// 主路径: WebCodecs 把 AudioBuffer 编码成 AAC + mp4-muxer 封装。返回 Uint8Array 或 null。
+// 需要 Chrome/Edge 94+ (AudioEncoder + AudioData 均原生). 会真实编码, 产物可被播放器识别。
+async function webcodecAacFromBuffer(ab, onLog) {
+  try {
+    if (typeof window.AudioEncoder === 'undefined' || typeof window.AudioData === 'undefined') {
+      throw new Error('WebCodecs 不可用 (仅 Chrome/Edge 94+)');
+    }
+    const m = await getMuxerMod();
+    const target = new m.ArrayBufferTarget();
+    const muxer = new m.Muxer({
+      target,
+      fastStart: 'in-memory',
+      audio: { codec: 'aac', sampleRate: ab.sampleRate, numberOfChannels: ab.numberOfChannels },
+    });
+    // 预先转成交错 f32 (大缓冲, 只做一次)
+    const ch = ab.numberOfChannels;
+    const rate = ab.sampleRate;
+    const frames = ab.length;
+    const interleaved = new Float32Array(frames * ch);
+    for (let c = 0; c < ch; c++) {
+      const srcCh = ab.getChannelData(c);
+      for (let i = 0; i < frames; i++) interleaved[i * ch + c] = srcCh[i];
+    }
+    const frame = 1024;
+    const frameCount = Math.floor(frames / frame);
+    if (frameCount < 1) throw new Error('音频太短, 无法编码');
+    let encErr = null;
+    const enc = new AudioEncoder({
+      output: (chunk, meta) => { try { muxer.addAudioChunk(chunk, meta); } catch (e) { encErr = e; } },
+      error: (e) => { encErr = e; },
+    });
+    enc.configure({ codec: 'mp4a.40.2', sampleRate: rate, numberOfChannels: ch });
+    for (let i = 0; i < frameCount; i++) {
+      const off = i * frame;
+      // AudioData 需要 ArrayBuffer; 从交错大缓冲切帧拷贝
+      const slice = new Float32Array(interleaved.buffer, off * ch * 4, frame * ch);
+      const ad = new AudioData({
+        format: 'f32',
+        sampleRate: rate,
+        numberOfFrames: frame,
+        numberOfChannels: ch,
+        timestamp: Math.round(i * frame * 1e6 / rate),
+        data: slice,
+      });
+      enc.encode(ad);
+      ad.close();
+      if (onLog && (i % 40 === 0 || i === frameCount - 1)) onLog('aac ' + ((i + 1) / frameCount * 100).toFixed(0) + '%');
+    }
+    await enc.flush();
+    enc.close();
+    if (encErr) throw encErr;
+    muxer.finalize();
+    const out = target.buffer;
+    if (!out || !out.byteLength) return null;
+    return new Uint8Array(out.slice(0));
+  } catch (e) {
+    console.warn('webcodecAacFromBuffer failed:', e);
+    return null;
+  }
+}
+
+// 兜底路径: PCM→WAV 封装 (零依赖, 任何播放器都认; 仅体积大)。返回 Uint8Array 或 null。
+function pcmToWav(ab) {
+  try {
+    const numCh = ab.numberOfChannels;
+    const rate = ab.sampleRate;
+    const frames = ab.length;
+    const bytesPerSample = 2; // 16-bit PCM
+    const blockAlign = numCh * bytesPerSample;
+    const dataSize = frames * blockAlign;
+    const buf = new ArrayBuffer(44 + dataSize);
+    const dv = new DataView(buf);
+    const wstr = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+    wstr(0, 'RIFF'); dv.setUint32(4, 36 + dataSize, true); wstr(8, 'WAVE');
+    wstr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, numCh, true);
+    dv.setUint32(24, rate, true); dv.setUint32(28, rate * blockAlign, true); dv.setUint16(32, blockAlign, true);
+    dv.setUint16(34, 16, true); wstr(36, 'data'); dv.setUint32(40, dataSize, true);
+    // 逐元素交错写 16-bit PCM (小端)
+    for (let i = 0; i < frames; i++) {
+      for (let c = 0; c < numCh; c++) {
+        const v = ab.getChannelData(c)[i];
+        dv.setInt16(44 + (i * numCh + c) * 2, Math.max(-32768, Math.min(32767, (v < 0 ? v * 0x8000 : v * 0x7FFF))), true);
+      }
+    }
+    return new Uint8Array(buf);
+  } catch (e) {
+    console.warn('pcmToWav failed:', e);
+    return null;
+  }
+}
+
+// 统一入口: 任意音频字节 → { kind: 'aac'|'wav'|null, data, dur, note }
+// kind=null 表示无法转换 (保留原始)。dur 用于时长一致性"检验"。
+async function transcodeToAac(buf, onLog) {
+  const ab = await decodeToBuffer(buf);
+  if (!ab) return { kind: null, data: null, dur: null, note: '浏览器无法解码该音频' };
+  try {
+    const aac = await webcodecAacFromBuffer(ab, onLog);
+    if (aac && aac.length) {
+      // 校验: 转码产物必须能被解码回 (真实解码 = 播放器能认的硬标准)
+      const back = await decodeToBuffer(aac);  // aac 是 Uint8Array
+      const ok = back && back.duration && Math.abs(back.duration - ab.duration) < 2;
+      return { kind: 'aac', data: aac, dur: ab.duration,
+               note: ok ? '' : 'AAC 校验失败 (时长异常), 保留原始' };
+    }
+  } catch (e) { console.warn('aac branch failed, falling back to wav:', e); }
+  const wav = pcmToWav(ab);
+  if (wav) return { kind: 'wav', data: wav, dur: ab.duration, note: '已降级为 WAV (浏览器不支持 AAC 编码或封装失败)' };
+  return { kind: null, data: null, dur: ab.duration, note: '转码失败, 保留原始 Opus' };
+}
+
+// 检验: AudioContext 真实解码转码产物, 返回 {ok, duration}。
+// 成功解码 = 结构合法可播 (这正是"播放器认不认"的硬标准)。
+function verifyAac(buf) {
+  return new Promise((resolve) => {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (typeof ctx.decodeAudioData !== 'function') { ctx.close && ctx.close(); resolve({ ok: false }); return; }
+      ctx.decodeAudioData(toArrayBuffer(buf), (audioBuf) => {
+        const duration = audioBuf ? audioBuf.duration : null;
+        ctx.close && ctx.close();
+        resolve({ ok: true, duration });
+      }, () => {
+        ctx.close && ctx.close();
+        resolve({ ok: false });
+      });
+    } catch (e) {
+      resolve({ ok: false });
+    }
+  });
+}
+
+// 检验原始 Opus 的解码时长 (仅 Chrome/Edge 支持 Opus-in-MP4 解码; 失败不影响主流程)
+function decodeDuration(buf) {
+  return new Promise((resolve) => {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      ctx.decodeAudioData(toArrayBuffer(buf), (ab) => { ctx.close && ctx.close(); resolve(ab ? ab.duration : null); },
+        () => { ctx.close && ctx.close(); resolve(null); });
+    } catch (e) { resolve(null); }
+  });
+}
+
 // 触发 zip 打包
-async function packZip(meta, audioBuf, imageBuf) {
+// audioInfo: sniff 结果 {ext, codec, encoding}; trans: 转码结果 {kind:'aac'|'wav'|null, data, dur, note}
+async function packZip(meta, audioBuf, imageBuf, audioInfo, trans) {
+  audioInfo = audioInfo || (sniffAudioInfo(audioBuf) || { ext: audioExt(meta.audio_url), codec: '', encoding: '' });
+  trans = trans || { kind: null, data: null, dur: null, note: '' };
   const titleSafe = safeFilename(meta.title, meta.work_id);
   const zip = new JSZip();
-  if (audioBuf) zip.file(titleSafe + '.mp3', audioBuf);
+  const isOpus = audioInfo.encoding === 'opus';
+  const audioEncNote = audioInfo.encoding || (audioInfo.codec || 'unknown');
+  const convExt = trans.kind === 'wav' ? '.wav' : '.m4a';
+  if (isOpus && trans.data) {
+    // 转换 + 保留: 转换产物主文件 + 原始 Opus
+    zip.file(titleSafe + (trans.kind === 'wav' ? '_converted' : '') + convExt, trans.data);
+    zip.file(titleSafe + '_opus_orig' + (audioInfo.ext || '.m4a'), audioBuf);
+  } else if (audioBuf) {
+    zip.file(titleSafe + (isOpus ? '_opus' : '') + (audioInfo.ext || audioExt(meta.audio_url)), audioBuf);
+  }
   if (imageBuf) zip.file('cover_1.jpg', imageBuf);
-  if (meta.lyrics && meta.lyrics.trim()) {
+  // 歌词: 优先用带时间轴的真·LRC, 否则降级为纯文本
+  const lrcText = (meta.lrc_text || '').trim();
+  if (lrcText) {
+    zip.file(titleSafe + '.lrc', lrcText);
+  } else if (meta.lyrics && meta.lyrics.trim()) {
     const header = '[ti:' + (meta.title || '') + ']\n[ar:' + (meta.user_name || '') + ']\n';
     zip.file(titleSafe + '.lrc', header + meta.lyrics);
   }
@@ -715,7 +1046,15 @@ async function packZip(meta, audioBuf, imageBuf) {
     user_name: meta.user_name,
     duration_sec: meta.duration,
     introduction: meta.introduction,
+    has_timed_lyrics: !!lrcText,
     audio_url: meta.audio_url,
+    audio: {
+      encoding: audioEncNote,
+      codec: audioInfo.codec || '',
+      transcoded: isOpus && !!trans.data,
+      transcode_kind: (trans.data && trans.kind) || null,
+      transcode_note: (trans.data ? (trans.note || '') : (trans.note || '')) || '',
+    },
     image_urls: meta.image_urls,
     fetched_at: new Date().toISOString(),
     note: 'fetched client-side, no backend stored',
@@ -727,11 +1066,30 @@ async function packZip(meta, audioBuf, imageBuf) {
     'duration: ' + (meta.duration || '') + ' sec',
     'workId:   ' + (meta.work_id || ''),
     'intro:    ' + (meta.introduction || ''),
+    'lyrics:   ' + (lrcText ? 'timed (LRC)' : (meta.lyrics ? 'plain text' : 'none')),
     'fetched:  ' + info.fetched_at,
     '',
+    'audio encoding: ' + audioEncNote + (audioInfo.codec ? ' (codec: ' + audioInfo.codec + ')' : ''),
+    '',
     'NOTE: 此 zip 由浏览器端静态工具生成, 不经过任何后端存储.',
-  ].join('\n');
-  zip.file('README.txt', readme);
+  ];
+  if (isOpus && trans.data) {
+    const mainName = titleSafe + (trans.kind === 'wav' ? '_converted' : '') + convExt;
+    readme.push(
+      '已转换为 ' + (trans.kind === 'wav' ? 'WAV' : 'AAC') + ' (浏览器端转码): ' + mainName,
+      '同时保留原始文件: ' + titleSafe + '_opus_orig' + (audioInfo.ext || '.m4a'),
+      '  - 原始文件为 OPUS 编码, 仅 Chrome/Edge/VLC/foobar/手机端等支持 Opus 的播放器可直接播放;',
+      '  - 普通桌面播放器/车载系统请使用 ' + (trans.kind === 'wav' ? 'WAV' : 'AAC') + ' 版本。'
+    );
+    if (trans.note) readme.push('  - 转码说明: ' + trans.note);
+  } else if (isOpus) {
+    readme.push(
+      '注意: 本文件为 OPUS 编码 (MP4 容器), 网页可播但普通播放器可能拒绝;',
+      '  - 浏览器内转码未成功 (浏览器不支持 WebCodecs/AudioDecoder, 或 mp4-muxer CDN 不可达),',
+      '  - 请使用支持 Opus 的播放器, 或改用 Python 版 (app.py) 自动转换为 AAC。'
+    );
+  }
+  zip.file('README.txt', readme.join('\n'));
 
   return await zip.generateAsync(
     { type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } },
@@ -762,7 +1120,7 @@ async function start() {
     if (!meta.audio_url) throw new Error('没有 audioUrl, 抓不到音频');
     const audioBuf = await fetchWithProgress(meta.audio_url, (rec, total) => {
       const p = total ? 0.08 + 0.74 * (rec / total) : 0.45;
-      setStage('downloading mp3: ' + fmtSize(rec) + ' / ' + fmtSize(total), p);
+      setStage('downloading audio: ' + fmtSize(rec) + ' / ' + fmtSize(total), p);
     });
     setStage('audio done, downloading cover ...', 0.84);
 
@@ -783,8 +1141,25 @@ async function start() {
       setStage('no cover, packing zip ...', 0.92);
     }
 
-    // 4) 打包
-    const blob = await packZip(meta, audioBuf, imageBuf);
+    // 4) 嗅探真实格式 (不信任 URL, 新版音频是 MP4+Opus)
+    setStage('sniffing audio format ...', 0.845);
+    const audioInfo = sniffAudioInfo(audioBuf) || { ext: audioExt(meta.audio_url), codec: '', encoding: '' };
+    // trans: {kind:'aac'|'wav'|null, data, dur, note} — 浏览器内转换+保留+检验
+    let trans = null;
+
+    if (audioInfo.encoding === 'opus') {
+      setStage('opus detected → transcoding (WebCodecs→AAC, fallback WAV) ...', 0.85);
+      try {
+        trans = await transcodeToAac(audioBuf, (m) => setStage('transcoding: ' + m.slice(0, 60), 0.85));
+      } catch (e) {
+        trans = { kind: null, data: null, dur: null, note: '转码异常 (' + (e.message || e) + '), 已保留原始 Opus 文件' };
+        console.warn('transcode failed:', e);
+      }
+      if (!trans) trans = { kind: null, data: null, dur: null, note: '转码失败, 已保留原始 Opus 文件' };
+    }
+
+    setStage('packing zip ...', 0.92);
+    const blob = await packZip(meta, audioBuf, imageBuf, audioInfo, trans);
     setStage('done, triggering download ...', 1.0);
 
     // 5) 触发下载
@@ -793,20 +1168,33 @@ async function start() {
     triggerDownload(blob, filename);
 
     // 6) 显示结果 + 入历史
-    showResult('ok',
+    const encLabel = audioInfo.encoding === 'opus' && trans && trans.data
+      ? 'Opus → ' + (trans.kind === 'wav' ? 'WAV' : 'AAC') + ' (已转码+校验)' : ((audioInfo.encoding || audioInfo.codec || 'unknown'));
+    let resultHtml =
       '<span class="tag">[OK]</span>fetch complete' +
       '<div class="line"><span class="k">title</span>' + escapeHtml(meta.title) + '</div>' +
       '<div class="line"><span class="k">workId</span>' + meta.work_id + '</div>' +
       '<div class="line"><span class="k">author</span>' + escapeHtml(meta.user_name || '?') + '</div>' +
-      '<div class="line"><span class="k">size</span>' + fmtSize(blob.size) + '</div>' +
-      '<a class="dl-btn" id="redownload">re-download</a>'
-    );
+      '<div class="line"><span class="k">audio</span>' + escapeHtml(encLabel) +
+        (audioInfo.codec ? ' (codec: ' + escapeHtml(audioInfo.codec) + ')' : '') + '</div>' +
+      '<div class="line"><span class="k">size</span>' + fmtSize(blob.size) + '</div>';
+    if (trans && trans.note) {
+      resultHtml += '<div class="line" style="color:var(--warn)"><span class="k">note</span>' + escapeHtml(trans.note) + '</div>';
+    }
+    resultHtml += '<a class="dl-btn" id="redownload">re-download</a>';
+    showResult('ok', resultHtml);
     $('redownload').addEventListener('click', () => triggerDownload(blob, filename));
     saveHistEntry({ filename, size: blob.size, ts: Math.floor(Date.now()/1000), workId: meta.work_id, title: meta.title });
     renderHist();
   } catch (e) {
     console.error(e);
-    showResult('err', '<span class="tag">[ERR]</span>' + escapeHtml(e.message || String(e)));
+    let msg = e.message || String(e);
+    // 静态版最常见的失败是浏览器跨域拦截 (TypeError: Failed to fetch)
+    if (e instanceof TypeError && /fetch/i.test(msg)) {
+      msg = '浏览器跨域请求被拦截 (CORS)。Muse 的接口可能临时收紧了来源白名单; ' +
+            '请改用 Python 版 (app.py) 或稍后重试。原始错误: ' + msg;
+    }
+    showResult('err', '<span class="tag">[ERR]</span>' + escapeHtml(msg));
     barChars.textContent = renderBar(0);
     setStage('failed', 0);
   } finally {
